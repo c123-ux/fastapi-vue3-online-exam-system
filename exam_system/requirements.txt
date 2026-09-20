@@ -1,0 +1,37 @@
+# 在线考试系统 · 依赖锁定清单
+# 基线来源：项目一 FastTask 在本机 Python 3.12.13 上实测跑通 74 例的组合（见 D2 §1.2）
+# 安装：python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# --- Web / ASGI ---
+fastapi==0.116.1
+starlette==0.47.3
+uvicorn==0.35.0
+pydantic==2.11.9
+
+# --- 数据层 ---
+SQLAlchemy==2.0.43
+alembic==1.16.5
+PyMySQL==1.1.2
+# MySQL 8 默认 caching_sha2_password 认证必需（实测 3307 上该插件生效）
+cryptography==46.0.1
+
+# --- 缓存 / 限时（本项目核心）---
+# 必须 <=5.x 或在客户端显式 protocol=2：Redis 5.0.14.1 不支持 HELLO 命令（RESP3），
+# redis-py 6+/8+ 默认发 `HELLO 3` 会在连接阶段直接失败（实测，见 D2 §1.1）
+redis==5.0.1
+
+# --- 认证 ---
+python-jose==3.5.0
+passlib==1.7.4
+# bcrypt>=5.0 与 passlib 1.7.4 不兼容（72 bytes 报错），实测锁定 4.3.0
+bcrypt==4.3.0
+
+# --- 配置 ---
+python-dotenv==1.1.1
+
+# --- 测试 ---
+pytest==8.4.2
+httpx==0.28.1
+# 以下两行为 2026-09-19 实装后回写的精确版本（D2 §1.2「安装后锁定并回写」约定）
+pytest-cov==7.1.0
+coverage==7.16.1

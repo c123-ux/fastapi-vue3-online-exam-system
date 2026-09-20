@@ -1,0 +1,19 @@
+# 依赖与环境
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行时产物
+*.db
+*.rdb
+*.log
+dump.rdb
+
+# 编辑器
+.vscode/
+.idea/
