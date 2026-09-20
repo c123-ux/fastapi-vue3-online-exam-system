@@ -275,7 +275,9 @@ def submit_exam(db: Session, student: User, record_id: int) -> dict[str, Any]:
 
 
 def settle_as_timeout(db: Session, record: ExamRecord) -> dict[str, Any] | None:
-    """惰性清算入口；被别人抢走则返回 None（EC-28）。"""
+    """惰性清算入口。**只在真的越过宽限期时**才清算（T12：未过期不得误清）。"""
+    if time_utils.now() <= record.deadline_at + _grace():
+        return None
     return _settle(db, record.id, SubmitKind.TIMEOUT, time_utils.now(), quiet=True)
 
 
@@ -413,6 +415,9 @@ def review_answer(
     row.review_status = ReviewStatus.REVIEWED
     row.review_comment = comment
     row.is_correct = given > 0
+    # autoflush=False 的会话里，不把上面的改动 flush 出去，紧接着的 COUNT/SUM
+    # 会读回旧值，导致"批完仍显示待批 + 总分不涨"（实测踩到，见 D4）
+    db.flush()
 
     pending = _pending_count(db, record.id)
     record.earned_score = Decimal(str(record.auto_score or 0)) + _manual_sum(db, record.id)
@@ -476,12 +481,17 @@ def resume_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
         if a.student_answer
     }
     paper = db.get(Paper, record.paper_id)
+    # 已交卷的记录回看时不该再显示倒计时（实测：交卷后仍显示 598 秒会让用户以为还能继续考）
+    if record.status == RecordStatus.IN_PROGRESS:
+        remaining = remaining_seconds(time_utils.now(), record.deadline_at)
+    else:
+        remaining = 0
     return {
         "record_id": record.id,
         "paper_id": record.paper_id,
         "paper_title": paper.title if paper else "",
         "duration_minutes": record.snapshot_json["duration_minutes"],
-        "remaining_seconds": remaining_seconds(time_utils.now(), record.deadline_at),
+        "remaining_seconds": remaining,
         "deadline_at": record.deadline_at,
         "resumed": bool(answers),
         "questions": [
@@ -611,7 +621,11 @@ def list_my_records(
             "started_at": r.started_at,
             "deadline_at": r.deadline_at,
             "submitted_at": r.submitted_at,
-            "remaining_seconds": remaining_seconds(now, r.deadline_at),
+            "remaining_seconds": (
+                remaining_seconds(now, r.deadline_at)
+                if r.status == RecordStatus.IN_PROGRESS
+                else 0
+            ),
             "cheat_count": r.cheat_count,
         }
         for r in records

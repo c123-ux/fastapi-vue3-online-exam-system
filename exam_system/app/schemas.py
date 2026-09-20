@@ -318,12 +318,14 @@ class ResultsOut(BaseModel):
 
 
 class QuestionStatOut(BaseModel):
+    """客观题给 correct_count/correct_rate（简答题这两项为 null）；简答题给 avg_score。"""
+
     question_id: int
     type: str
     full_score: float
-    answered_count: int = 0
-    correct_count: int = 0
-    correct_rate: float = 0.0
+    answered_count: int | None = None
+    correct_count: int | None = None
+    correct_rate: float | None = None
     avg_score: float | None = None
 
 

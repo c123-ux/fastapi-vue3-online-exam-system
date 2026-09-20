@@ -23,8 +23,9 @@ LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
 def setup_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(level=level, format=LOG_FORMAT)
-    for noisy in ("uvicorn.access",):  # pragma: no cover
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # passlib 1.7.4 读 bcrypt 4.x 的 __about__ 版本会打一条 trapped 警告（不影响功能），
+    # 它走的是 logging 而不是异常，所以只能在这里压掉，否则每次注册都刷屏
+    logging.getLogger("passlib.handlers.bcrypt").setLevel(logging.ERROR)
 
 
 def _mysql_ok() -> bool:

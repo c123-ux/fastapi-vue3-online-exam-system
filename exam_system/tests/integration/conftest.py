@@ -83,6 +83,15 @@ def client(_bootstrap: None) -> Iterator[TestClient]:
         yield c
 
 
+@pytest.fixture(scope="session")
+def raw_client(_bootstrap: None) -> Iterator[TestClient]:
+    """不重抛服务端异常的客户端：用来断言 500 响应体（Redis 故障、判分抛异常）。"""
+    from app.main import app
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
+
+
 @pytest.fixture(autouse=True)
 def _clean(_bootstrap: None) -> Iterator[None]:
     from sqlalchemy import create_engine, text

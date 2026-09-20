@@ -26,6 +26,7 @@ ERRORS: dict[str, tuple[int, str]] = {
     "EXAM_ENDED": (400, "exam window has ended"),
     "EXAM_CLOSED": (400, "exam is closed"),
     "EXAM_WINDOW_TOO_SHORT": (400, "remaining exam window is too short to start"),
+    "QUESTION_NOT_IN_PAPER": (400, "question does not belong to this paper snapshot"),
     # 401 未认证
     "INVALID_CREDENTIALS": (401, "username or password is wrong"),
     "TOKEN_INVALID": (401, "authentication token missing or invalid"),

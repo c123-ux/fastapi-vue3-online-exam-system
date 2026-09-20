@@ -2,7 +2,7 @@
 
 约定（D2 §4）：utf8mb4；所有 String 显式长度（MySQL 必需，SQLite 不报是隐蔽坑）；
 分值 DECIMAL；时间 DATETIME(3) 且一律由应用层 time_utils.now() 写入，
-表内不出现 server_default=func.now()（TC-S-01 静态断言）。
+表内不设数据库端默认时间（TC-S-01 静态断言会扫这一点）。
 """
 from __future__ import annotations
 
@@ -127,7 +127,8 @@ class Question(Base):
 
     __table_args__ = (
         Index("ix_questions_category_type", "category_id", "type"),
-        Index("ix_questions_created_by", "created_by"),
+        # created_by 是 FK，InnoDB 会自动建索引；再显式声明一个单列索引是冗余
+        # （实测冗余索引还会让 alembic downgrade 报 1553 "needed in a foreign key constraint"）
         {"comment": "题库"},
     )
 
@@ -161,9 +162,9 @@ class PaperQuestion(Base):
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (
-        # 左前缀已覆盖按 paper_id 的查询，不再单建普通索引（对需求文档的有意偏离，D2 §10.2 #5）
+        # 左前缀已覆盖按 paper_id 的查询，不再单建普通索引（对需求文档的有意偏离，D2 §10.2 #5）；
+        # question_id 由 FK 自动索引支撑引用检查与聚合，不重复声明
         UniqueConstraint("paper_id", "question_id", name="uq_pq_paper_question"),
-        Index("ix_pq_question", "question_id"),
         {"comment": "试卷-题目关联，逐题分值"},
     )
 
@@ -216,6 +217,6 @@ class Answer(Base):
 
     __table_args__ = (
         UniqueConstraint("record_id", "question_id", name="uq_answers_record_question"),
-        Index("ix_answers_question", "question_id"),
+        # question_id 的聚合与引用检查由 FK 自动索引支撑，不重复声明（见 questions 表同款注释）
         {"comment": "作答明细（upsert 语义，支撑续考与判分补齐）"},
     )

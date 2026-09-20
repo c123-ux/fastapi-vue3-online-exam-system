@@ -1,0 +1,173 @@
+﻿# 在线考试系统 · 手工端到端实录
+
+- 时间：2026-09-20 21:45:30
+- 服务：http://127.0.0.1:8000（uvicorn，单实例）
+- 依赖：MySQL 8.0.46 @3307 / 本机原生 Redis 5.0.14.1 (db0)
+- 账号：vt_teacher63499（teacher）、vt_stu63499（student），注册码来自 .env
+
+### 0. 健康检查
+```
+PS> curl.exe -s http://127.0.0.1:8000/health
+{"status":"ok","deps":{"mysql":"ok","redis":"ok"}}
+```
+### 1. 教师注册（带注册码）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/auth/register --data @body.json
+{"id":43,"username":"vt_teacher63499","role":"teacher","full_name":"验证老师"}
+```
+### 2. 无注册码注册教师被拒（EC-26）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/auth/register --data @body_no_code.json
+{"code":"INVALID_TEACHER_CODE","message":"teacher register code is missing or wrong","detail":"教师注册码缺失或错误"}
+```
+### 3. 教师登录拿 JWT
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/auth/token --data @body.json
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdW ...(token 截断)
+```
+### 4. 建分类
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/categories -H "Authorization: Bearer <t>" --data @body.json
+{"id":3,"name":"验证分类"}
+```
+### 5. 建四题型各 1 题（5/15/10/20 = 卷面 50）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/questions -H "Authorization: Bearer <t>" --data @body.json
+{"id":13,"type":"single","content":"验证题1 单选","options":["A. 对","B. 错","C. 也许","D. 不知道"],"correct_answer":"A","difficulty":"easy","category_id":3}
+{"id":14,"type":"multiple","content":"验证题2 多选","options":["A. 甲","B. 乙","C. 丙","D. 丁"],"correct_answer":"A,C","difficulty":"medium","category_id":3}
+{"id":15,"type":"judge","content":"验证题3 判断","options":null,"correct_answer":"T","difficulty":"easy","category_id":3}
+{"id":16,"type":"short","content":"验证题4 简答","options":null,"correct_answer":"参考答案要点","difficulty":"hard","category_id":3}
+```
+### 6. 题目校验矩阵：答案字母越界 → 400（EC/FR-02）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/questions --data @body_bad_answer.json
+{"code":"INVALID_QUESTION","message":"question content does not match its type rules","detail":"单选题答案必须是单个且在选项范围内的字母，当前 Z"}
+```
+### 7. 组卷（逐题分值，full_score 自动求和=50）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/papers --data @body_paper.json
+{"id":2,"title":"验证卷","duration_minutes":10,"start_at":"2026-09-20T21:40:31","end_at":"2026-09-20T23:45:31","status":"draft","full_score":50.0}
+```
+### 8. 发布试卷 draft→published
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/papers/2/publish -H "Authorization: Bearer <t>"
+{"id":2,"title":"验证卷","duration_minutes":10,"start_at":"2026-09-20T21:40:31","end_at":"2026-09-20T23:45:31","status":"published","full_score":50.0}
+```
+### 9. 卷面详情（创建者可见答案）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/papers/2 -H "Authorization: Bearer <t>"
+{"id":2,"title":"验证卷","duration_minutes":10,"start_at":"2026-09-20T21:40:31","end_at":"2026-09-20T23:45:31","status":"published","full_score":50.0,"creator_id":43,"items":[{"question_id":13,"sort_order":1,"score":5.0,"type":"single","content":"验证题1 单选","options":["A. 对","B. 错","C. 也许","D. 不知道"],"correct_answer":"A"},{"question_id":14,"sort_order":2,"score":15.0,"type":"multiple","content":"验证题2 多选","options":["A. 甲","B. 乙","C. 丙","D. 丁"],"correct_answer":"A,C"},{"question_id":15,"sort_order":3,"score":10.0,"type":"judge","content":"验证题3 判断","options":null,"correct_answer":"T"},{"question_id":16,"sort_order":4,"score":20.0,"type":"short","content":"验证题4 简答","options":null,"correct_answer":"参考答案要点"}]}
+```
+### 10. 学生注册并登录（无注册码要求）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/auth/register --data @body_student.json
+{"id":44,"username":"vt_stu63499","role":"student","full_name":"验证学生"}
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR ...
+```
+### 11. 学生调建题接口 → 403（RBAC）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/questions -H "Authorization: Bearer <s>" --data @body.json
+{"code":"ROLE_FORBIDDEN","message":"current role is not allowed to access this resource","detail":"该接口仅限 teacher 角色"}
+```
+### 12. 学生开考（返回题面不含答案 + remaining 600）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/2/start -H "Authorization: Bearer <s>"
+{"record_id":36,"paper_id":2,"paper_title":"验证卷","duration_minutes":10,"remaining_seconds":599,"deadline_at":"2026-09-20T21:55:32.125000","resumed":false,"questions":[{"question_id":13,"sort_order":1,"type":"single","score":5.0,"content":"验证题1 单选","options":["A. 对","B. 错","C. 也许","D. 不知道"]},{"question_id":14,"sort_order":2,"type":"multiple","score":15.0,"content":"验证题2 多选","options":["A. 甲","B. 乙","C. 丙","D. 丁"]},{"question_id":15,"sort_order":3,"type":"judge","score":10.0,"content":"验证题3 判断","options":null},{"question_id":16,"sort_order":4,"type":"short","score":20.0,"content":"验证题4 简答","options":null}],"answers":{}}
+```
+### 13. Redis 会话 TTL 实测（应≈630=600+宽限30）
+```
+PS> D:\Redis\redis-cli.exe -n 0 TTL exam:session:36
+TTL = 629
+```
+### 14. 重复 start 幂等且不续时（A7 回归：deadline 不变）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/2/start -H "Authorization: Bearer <s>"
+{"record_id":36,"paper_id":2,"paper_title":"验证卷","duration_minutes":10,"remaining_seconds":599,"deadline_at":"2026-09-20T21:55:32.125000","resumed":true,"questions":[{"question_id":13,"sort_order":1,"type":"single","score":5.0,"content":"验证题1 单选","options":["A. 对","B. 错","C. 也许","D. 不知道"]},{"question_id":14,"sort_order":2,"type":"multiple","score":15.0,"content":"验证题2 多选","options":["A. 甲","B. 乙","C. 丙","D. 丁"]},{"question_id":15,"sort_order":3,"type":"judge","score":10.0,"content":"验证题3 判断","options":null},{"question_id":16,"sort_order":4,"type":"short","score":20.0,"content":"验证题4 简答","options":null}],"answers":{}}
+```
+### 15. 逐题作答（小写/乱序数组/中文判断都自动归一）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/answer --data @body.json  ×4
+{"saved":true,"answered_count":1,"remaining_seconds":599}
+{"saved":true,"answered_count":2,"remaining_seconds":599}
+{"saved":true,"answered_count":3,"remaining_seconds":599}
+{"saved":true,"answered_count":4,"remaining_seconds":599}
+```
+### 16. 切屏上报只写 DB（无 Redis 键）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/cheat-report --data @body.json
+{"record_id":36,"cheat_count":1}
+```
+### 17. 交卷判分（客观 5+15+10=30，简答待批）+ 响应耗时
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/submit -w "time_total=%{time_total}s"
+{"record_id":36,"status":"final","submit_kind":"normal","auto_score":30.0,"earned_score":30.0,"full_score":50.0,"pending_review_count":1,"review_state":"pending","submitted_at":"2026-09-20T21:45:32.483071"}
+time_total=0.013529s
+```
+### 18. 重复提交 → 409 且携带首次成绩（FR-10）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/submit
+{"code":"ALREADY_SUBMITTED","message":"exam record has already been submitted","detail":{"record_id":36,"submitted_at":"2026-09-20T21:45:32.483000","earned_score":30.0}}
+```
+### 19. 学生查成绩（无答案、无学生作答原文，含待批数）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/exams/36/score -H "Authorization: Bearer <s>"
+{"record_id":36,"paper_id":2,"paper_title":"验证卷","status":"final","submit_kind":"normal","review_state":"pending","auto_score":30.0,"manual_score":0.0,"earned_score":30.0,"full_score":50.0,"pending_review_count":1,"submitted_at":"2026-09-20T21:45:32.483000","deadline_at":"2026-09-20T21:55:32.125000","is_finalized":false,"details":[{"question_id":13,"type":"single","sort_order":1,"full_score":5.0,"score":5.0,"is_correct":true,"review_status":null,"review_comment":null},{"question_id":14,"type":"multiple","sort_order":2,"full_score":15.0,"score":15.0,"is_correct":true,"review_status":null,"review_comment":null},{"question_id":15,"type":"judge","sort_order":3,"full_score":10.0,"score":10.0,"is_correct":true,"review_status":null,"review_comment":null},{"question_id":16,"type":"short","sort_order":4,"full_score":20.0,"score":null,"is_correct":null,"review_status":"needs_review","review_comment":null}]}
+```
+### 20. 教师读作答（批改入口，A6 闭环）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/exams/36/answers -H "Authorization: Bearer <t>"
+{"record_id":36,"paper_id":2,"student":{"id":44,"username":"vt_stu63499","role":"student","full_name":"验证学生"},"pending_review_count":1,"items":[{"question_id":13,"type":"single","sort_order":1,"full_score":5.0,"student_answer":"A","review_status":null,"score":5.0,"review_comment":null,"reference_answer":"A"},{"question_id":14,"type":"multiple","sort_order":2,"full_score":15.0,"student_answer":"A,C","review_status":null,"score":15.0,"review_comment":null,"reference_answer":"A,C"},{"question_id":15,"type":"judge","sort_order":3,"full_score":10.0,"student_answer":"T","review_status":null,"score":10.0,"review_comment":null,"reference_answer":"T"},{"question_id":16,"type":"short","sort_order":4,"full_score":20.0,"student_answer":"我写了简答要点","review_status":"needs_review","score":null,"review_comment":null,"reference_answer":"参考答案要点"}]}
+```
+### 21. 批改简答 18 分 → earned 48/50，记录定稿
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/review --data @body_review.json
+{"record_id":36,"question_id":16,"score":18.0,"earned_score":48.0,"pending_review_count":0,"review_state":"final"}
+```
+### 22. 批改越界 → 400（EC-27）
+```
+PS> curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/review --data @body_over.json
+{"code":"INVALID_SCORE","message":"score out of allowed range","detail":"批改分值必须在 0~20.0 之间"}
+```
+### 23. 改已发布题目的答案 → 409 QUESTION_LOCKED（EC-22 判分基准保护）
+```
+PS> curl.exe -s -X PUT http://127.0.0.1:8000/api/questions/13 --data @body_change_answer.json
+{"code":"QUESTION_LOCKED","message":"question is locked because a published paper references it","detail":"该题已被已发布/已关闭试卷引用，判分基准字段不可修改"}
+```
+### 24. 统计（两级均分含样本数）+ 响应耗时
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/papers/2/stats -w "time_total=%{time_total}s"
+{"paper_id":2,"finished_count":1,"timeout_count":0,"graded_count":1,"pending_review_count":0,"reaped_count":0,"avg_score":48.0,"avg_scored_count":1,"max_score":48.0,"min_score":48.0,"avg_auto_score":30.0,"question_stats":[{"question_id":13,"type":"single","full_score":5.0,"answered_count":1,"correct_count":1,"correct_rate":1.0,"avg_score":null},{"question_id":14,"type":"multiple","full_score":15.0,"answered_count":1,"correct_count":1,"correct_rate":1.0,"avg_score":null},{"question_id":15,"type":"judge","full_score":10.0,"answered_count":1,"correct_count":1,"correct_rate":1.0,"avg_score":null},{"question_id":16,"type":"short","full_score":20.0,"answered_count":null,"correct_count":null,"correct_rate":null,"avg_score":18.0}]}
+time_total=0.009404s
+```
+### 25. 全班成绩列表
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/papers/2/results
+{"paper_id":2,"finished_count":1,"reaped_count":0,"rows":[{"record_id":36,"student_id":44,"username":"vt_stu63499","full_name":"验证学生","status":"final","submit_kind":"normal","review_state":"final","earned_score":48.0,"auto_score":30.0,"full_score":50.0,"submitted_at":"2026-09-20T21:45:32.483000","cheat_count":1}]}
+```
+### 26. 跨学生查他人成绩 → 404（与『不存在』完全同形）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/exams/36/score -H "Authorization: <other token>"
+{"code":"RECORD_NOT_VISIBLE","message":"exam record not found or not visible to you","detail":null}
+{"code":"RECORD_NOT_VISIBLE","message":"exam record not found or not visible to you","detail":null}
+```
+### 27. 无 token → 401（判定顺序第一档）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/questions
+{"code":"TOKEN_INVALID","message":"authentication token missing or invalid","detail":"缺少 Authorization: Bearer <token>"}
+```
+### 28. 我的考试列表（与 /api/exams/{id} 同时可达，N2 路由回归）
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/exams -H "Authorization: Bearer <s>"
+{"total":1,"page":1,"page_size":20,"items":[{"record_id":36,"paper_id":2,"paper_title":"验证卷","status":"final","submit_kind":"normal","review_state":"final","earned_score":48.0,"full_score":50.0,"started_at":"2026-09-20T21:45:32.125000","deadline_at":"2026-09-20T21:55:32.125000","submitted_at":"2026-09-20T21:45:32.483000","remaining_seconds":598,"cheat_count":1}]}
+```
+### 29. 已结束记录访问续考响应
+```
+PS> curl.exe -s http://127.0.0.1:8000/api/exams/36 -H "Authorization: Bearer <s>"
+{"record_id":36,"paper_id":2,"paper_title":"验证卷","duration_minutes":10,"remaining_seconds":598,"deadline_at":"2026-09-20T21:55:32.125000","resumed":true,"questions":[{"question_id":13,"sort_order":1,"type":"single","score":5.0,"content":"验证题1 单选","options":["A. 对","B. 错","C. 也许","D. 不知道"]},{"question_id":14,"sort_order":2,"type":"multiple","score":15.0,"content":"验证题2 多选","options":["A. 甲","B. 乙","C. 丙","D. 丁"]},{"question_id":15,"sort_order":3,"type":"judge","score":10.0,"content":"验证题3 判断","options":null},{"question_id":16,"sort_order":4,"type":"short","score":20.0,"content":"验证题4 简答","options":null}],"answers":{"13":"A","14":"A,C","15":"T","16":"我写了简答要点"}}
+```
+### 30. 性能观察值（NFR-01 已降为观察项，不作为验收数字）
+```
+PS> 循环 10 次 curl.exe -s http://127.0.0.1:8000/api/papers -w "time_total=%{time_total}s"
+10 次耗时(秒)=0.005204, 0.005107, 0.005122, 0.005379, 0.005069, 0.00529, 0.004892, 0.005111, 0.004893, 0.004794
+近似 P95=0.00529 s（样本只有 10 次，只作观察）
+```
