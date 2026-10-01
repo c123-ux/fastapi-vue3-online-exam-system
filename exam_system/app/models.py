@@ -189,6 +189,9 @@ class ExamRecord(Base):
     snapshot_json: Mapped[Any] = mapped_column(
         JSON, nullable=False, comment="判分基线（含正确答案，绝不出现在任何响应里）"
     )
+    snapshot_hash: Mapped[str | None] = mapped_column(
+        String(64), comment="快照 HMAC-SHA256 指纹；读取判分基线前必须验签（防改库改分）"
+    )
 
     __table_args__ = (
         UniqueConstraint("paper_id", "student_id", name="uq_exam_paper_student"),

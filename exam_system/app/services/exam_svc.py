@@ -1,4 +1,4 @@
-"""考试编排：开考/续考/作答/交卷/惰性清算/批改/切屏（D2 §2.2、§2.5、§6.3~6.6）。
+"""考试编排：开考/续考/作答/交卷/惰性清算（D2 §2.2、§2.5、§6.3~6.6）。
 
 三条不可让步的正确性约束：
 - deadline_at 只在 T1 首次开考写入，幂等分支永不更新（A7 限时绕过）；
@@ -13,9 +13,10 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
-from app import redis_client, time_utils
+from app import redis_client, snapshot_guard, time_utils
 from app.config import settings
 from app.exceptions import AppError
 from app.models import (
@@ -72,52 +73,6 @@ def _grace() -> timedelta:
     return timedelta(seconds=settings.exam_grace_seconds)
 
 
-# ------------------------------------------------------------------ 记录存取
-def _load_student_record(db: Session, record_id: int, student_id: int) -> ExamRecord:
-    record = db.get(ExamRecord, record_id)
-    if record is None or record.student_id != student_id:
-        raise AppError.make("RECORD_NOT_VISIBLE")
-    return record
-
-
-def _load_creator_record(db: Session, record_id: int, teacher_id: int) -> ExamRecord:
-    record = db.get(ExamRecord, record_id)
-    paper = None if record is None else db.get(Paper, record.paper_id)
-    if record is None or paper is None or paper.creator_id != teacher_id:
-        raise AppError.make("RECORD_NOT_VISIBLE")
-    return record
-
-
-def load_record_for_reader(db: Session, record_id: int, user: User) -> ExamRecord:
-    """学生读自己的；老师读自己试卷的；其余一律同一形态 404（EC-19）。"""
-    if user.role == Role.STUDENT:
-        return _load_student_record(db, record_id, user.id)
-    return _load_creator_record(db, record_id, user.id)
-
-
-def _record_for_update(db: Session, record_id: int) -> ExamRecord:
-    """行锁加载：批改与作答的读-改-写必须在同一事务内原子（B11）。"""
-    record = db.get(ExamRecord, record_id, with_for_update=True)
-    if record is None:  # pragma: no cover - 调用方已判 404
-        raise AppError.make("RECORD_NOT_VISIBLE")
-    return record
-
-
-def _snapshot_item(record: ExamRecord, question_id: int) -> dict[str, Any]:
-    for item in record.snapshot_json["items"]:
-        if item["question_id"] == question_id:
-            return item
-    raise AppError.make("QUESTION_NOT_IN_PAPER", f"题目 {question_id} 不在本卷判分基线内")
-
-
-def _submitted_hint(record: ExamRecord) -> dict[str, Any]:
-    return {
-        "record_id": record.id,
-        "submitted_at": record.submitted_at.isoformat() if record.submitted_at else None,
-        "earned_score": float(record.earned_score) if record.earned_score is not None else None,
-    }
-
-
 # ------------------------------------------------------------------ T1/T2/T3
 def start_exam(db: Session, student: User, paper_id: int) -> tuple[ExamRecord, bool]:
     """返回 (记录, 是否为续考分支)。"""
@@ -139,6 +94,7 @@ def start_exam(db: Session, student: User, paper_id: int) -> tuple[ExamRecord, b
     if window_too_short(now, paper.end_at, paper.duration_minutes):
         raise AppError.make("EXAM_WINDOW_TOO_SHORT")
 
+    snapshot = paper_svc.build_snapshot(db, paper)
     record = ExamRecord(
         paper_id=paper.id,
         student_id=student.id,
@@ -146,7 +102,8 @@ def start_exam(db: Session, student: User, paper_id: int) -> tuple[ExamRecord, b
         deadline_at=compute_deadline(now, paper.duration_minutes, paper.end_at),
         status=RecordStatus.IN_PROGRESS,
         cheat_count=0,
-        snapshot_json=paper_svc.build_snapshot(db, paper),
+        snapshot_json=snapshot,
+        snapshot_hash=snapshot_guard.sign_snapshot(snapshot),
     )
     db.add(record)
     try:
@@ -177,6 +134,7 @@ def _resume_existing(db: Session, record: ExamRecord) -> ExamRecord:
         raise AppError.make("ALREADY_SUBMITTED", _submitted_hint(record))
     ttl = session_ttl(time_utils.now(), record.deadline_at, settings.exam_grace_seconds)
     if ttl <= 0:
+        from app.services.exam_admin_svc import settle_as_timeout
         settle_as_timeout(db, record)
         raise AppError.make("ALREADY_SUBMITTED", _submitted_hint(record))
     current = _safe_session_ttl(record.id)
@@ -197,6 +155,7 @@ def _safe_session_ttl(rid: int) -> int | None:
 
 
 def _session_payload(record: ExamRecord) -> dict[str, Any]:
+    snapshot_guard.verified_snapshot(record)
     return {
         "record_id": record.id,
         "started_at": record.started_at.isoformat(),
@@ -220,19 +179,26 @@ def save_answer(db: Session, student: User, record_id: int, question_id: int, ra
         raise AppError.make("NOT_IN_PROGRESS", "记录已结束，不能再作答")
     now = time_utils.now()
     if now > locked.deadline_at + _grace():
+        from app.services.exam_admin_svc import settle_as_timeout
         settle_as_timeout(db, locked)
         raise AppError.make("EXAM_TIME_UP", _submitted_hint(locked))
 
-    item = _snapshot_item(locked, question_id)
+    snapshot = snapshot_guard.verified_snapshot(locked)
+    item = paper_svc.snapshot_item(snapshot, question_id)
     normalized = grade_svc.normalize_answer(item["type"], raw)
-    row = db.scalar(
-        select(Answer).where(Answer.record_id == locked.id, Answer.question_id == question_id)
+    # V-02 修复：用 MySQL 原生 `INSERT ... ON DUPLICATE KEY UPDATE` 做原子 upsert。
+    #   手动"先 select 看不存在再 insert"在 REPEATABLE READ 下是快照读，看不到并发事务刚插入的
+    #   同一 (record_id, question_id) 行，于是两条并发都走 insert → 命中唯一约束 → 500 并泄露 DB 原文。
+    #   原生 upsert 由 InnoDB 在索引冲突时原子判重并更新，天然免去该竞态。
+    stmt = mysql_insert(Answer).values(
+        record_id=locked.id, question_id=question_id,
+        student_answer=normalized, answered_at=now,
     )
-    if row is None:
-        row = Answer(record_id=locked.id, question_id=question_id)
-        db.add(row)
-    row.student_answer = normalized
-    row.answered_at = now
+    stmt = stmt.on_duplicate_key_update(
+        student_answer=stmt.inserted.student_answer,
+        answered_at=stmt.inserted.answered_at,
+    )
+    db.execute(stmt)
     db.commit()
     return answered_count(db, locked.id)
 
@@ -274,13 +240,6 @@ def submit_exam(db: Session, student: User, record_id: int) -> dict[str, Any]:
     return payload
 
 
-def settle_as_timeout(db: Session, record: ExamRecord) -> dict[str, Any] | None:
-    """惰性清算入口。**只在真的越过宽限期时**才清算（T12：未过期不得误清）。"""
-    if time_utils.now() <= record.deadline_at + _grace():
-        return None
-    return _settle(db, record.id, SubmitKind.TIMEOUT, time_utils.now(), quiet=True)
-
-
 def _submit_marked(rid: int) -> bool:
     try:
         return redis_client.submit_marked(rid)
@@ -292,6 +251,10 @@ def _submit_marked(rid: int) -> bool:
 def _settle(
     db: Session, record_id: int, kind: str, now: datetime, *, quiet: bool = False
 ) -> dict[str, Any] | None:
+    # 验签先于抢闸：脏基线的记录连提交状态都进不去，事务零副作用
+    pre = db.get(ExamRecord, record_id)
+    if pre is not None:
+        snapshot_guard.verified_snapshot(pre)
     if not _claim(db, record_id, kind, now):
         db.rollback()
         if quiet:
@@ -363,29 +326,44 @@ def _mark_after_commit(rid: int) -> None:
         logger.error("Redis 提交标记写入失败 record_id=%s：%s（不影响成绩）", rid, exc)
 
 
+# ------------------------------------------------------------------ 读模型
+def resume_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
+    from app.services.exam_reader_svc import build_resume_payload
+    return build_resume_payload(db, record)
+
+
+def score_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
+    from app.services.exam_reader_svc import build_score_payload
+    return build_score_payload(db, record)
+
+
+def answers_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
+    from app.services.exam_reader_svc import build_answers_payload
+    return build_answers_payload(db, record)
+
+
+def list_my_records(
+    db: Session, student: User, page: int, page_size: int
+) -> tuple[list[dict[str, Any]], int]:
+    from app.services.exam_reader_svc import build_my_records
+    return build_my_records(db, student, page, page_size)
+
+
+def record_or_404(db: Session, record_id: int) -> ExamRecord:
+    record = db.get(ExamRecord, record_id)
+    if record is None:
+        raise AppError.make("RECORD_NOT_VISIBLE")
+    return record
+
+
+# ------------------------------------------------------------------ 管理操作
 def reap_expired(
     db: Session, *, paper_id: int | None = None, student_id: int | None = None
 ) -> int:
-    """读路径兜底清算。时间比较在 Python 侧做（N9：SQL 内禁用 NOW()）。"""
-    conds = [ExamRecord.status == RecordStatus.IN_PROGRESS]
-    if paper_id is not None:
-        conds.append(ExamRecord.paper_id == paper_id)
-    if student_id is not None:
-        conds.append(ExamRecord.student_id == student_id)
-    now = time_utils.now()
-    grace = _grace()
-    reaped = 0
-    for record in list(db.scalars(select(ExamRecord).where(*conds))):
-        if now <= record.deadline_at + grace:
-            continue
-        if settle_as_timeout(db, record) is not None:
-            reaped += 1
-    if reaped:
-        logger.warning("惰性清算完成 %s 条超时记录", reaped)
-    return reaped
+    from app.services.exam_admin_svc import reap_expired as _reap
+    return _reap(db, paper_id=paper_id, student_id=student_id)
 
 
-# ------------------------------------------------------------------ T9 批改
 def review_answer(
     db: Session,
     teacher: User,
@@ -394,247 +372,61 @@ def review_answer(
     score: float,
     comment: str | None,
 ) -> dict[str, Any]:
-    _load_creator_record(db, record_id, teacher.id)
-    record = _record_for_update(db, record_id)
-    if record.status != RecordStatus.FINAL:
-        raise AppError.make("NOT_IN_PROGRESS", "记录尚未交卷，不能批改")
-    item = _snapshot_item(record, question_id)
-    if item["type"] != QType.SHORT:
-        raise AppError.make("NOT_SHORT_QUESTION", "只有简答题可以人工批改")
-    given = Decimal(str(score))
-    full = Decimal(str(item["score"]))
-    if not grade_svc.review_score_allowed(given, full):
-        raise AppError.make("INVALID_SCORE", f"批改分值必须在 0~{full} 之间")
-
-    row = db.scalar(
-        select(Answer).where(Answer.record_id == record.id, Answer.question_id == question_id)
-    )
-    if row is None:  # pragma: no cover - 判分已补齐全卷
-        raise AppError.make("NOT_FOUND", "该题作答记录不存在")
-    row.score = given
-    row.review_status = ReviewStatus.REVIEWED
-    row.review_comment = comment
-    row.is_correct = given > 0
-    # autoflush=False 的会话里，不把上面的改动 flush 出去，紧接着的 COUNT/SUM
-    # 会读回旧值，导致"批完仍显示待批 + 总分不涨"（实测踩到，见 D4）
-    db.flush()
-
-    pending = _pending_count(db, record.id)
-    record.earned_score = Decimal(str(record.auto_score or 0)) + _manual_sum(db, record.id)
-    record.review_state = ReviewState.FINAL if pending == 0 else ReviewState.PENDING
-    db.commit()
-    logger.info("批改完成 record_id=%s question_id=%s earned=%s", record.id, question_id, record.earned_score)
-    return {
-        "record_id": record.id,
-        "question_id": question_id,
-        "score": float(given),
-        "auto_score": float(record.auto_score or 0),
-        "manual_score": float(_manual_sum(db, record.id)),
-        "earned_score": float(record.earned_score),
-        "full_score": float(record.snapshot_json["full_score"]),
-        "pending_review_count": pending,
-        "review_state": record.review_state,
-    }
+    from app.services.exam_admin_svc import review_answer as _review
+    return _review(db, teacher, record_id, question_id, score, comment)
 
 
-def _manual_sum(db: Session, record_id: int) -> Decimal:
-    rows = db.scalars(
-        select(Answer.score).where(
-            Answer.record_id == record_id, Answer.review_status == ReviewStatus.REVIEWED
-        )
-    )
-    return sum((Decimal(str(s)) for s in rows if s is not None), Decimal("0"))
-
-
-def _pending_count(db: Session, record_id: int) -> int:
-    return int(
-        db.scalar(
-            select(func.count())
-            .select_from(Answer)
-            .where(Answer.record_id == record_id, Answer.review_status == ReviewStatus.NEEDS_REVIEW)
-        )
-        or 0
-    )
-
-
-# ------------------------------------------------------------------ T11 切屏
 def report_cheat(db: Session, student: User, record_id: int) -> int:
-    record = _load_student_record(db, record_id, student.id)
-    result = db.execute(
-        update(ExamRecord)
-        .where(ExamRecord.id == record.id, ExamRecord.status == RecordStatus.IN_PROGRESS)
-        .values(cheat_count=ExamRecord.cheat_count + 1)
-    )
-    if int(result.rowcount or 0) != 1:
-        db.rollback()
-        raise AppError.make("NOT_IN_PROGRESS", "记录已结束，切屏不再计数")
-    db.commit()
-    db.refresh(record)
-    return int(record.cheat_count)
+    from app.services.exam_admin_svc import report_cheat as _cheat
+    return _cheat(db, student, record_id)
 
 
-# ------------------------------------------------------------------ 读模型
-def resume_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
-    answers = {
-        str(a.question_id): a.student_answer
-        for a in db.scalars(select(Answer).where(Answer.record_id == record.id))
-        if a.student_answer
-    }
-    paper = db.get(Paper, record.paper_id)
-    # 已交卷的记录回看时不该再显示倒计时（实测：交卷后仍显示 598 秒会让用户以为还能继续考）
-    if record.status == RecordStatus.IN_PROGRESS:
-        remaining = remaining_seconds(time_utils.now(), record.deadline_at)
-    else:
-        remaining = 0
-    return {
-        "record_id": record.id,
-        "paper_id": record.paper_id,
-        "paper_title": paper.title if paper else "",
-        "duration_minutes": record.snapshot_json["duration_minutes"],
-        "remaining_seconds": remaining,
-        "deadline_at": record.deadline_at,
-        "resumed": bool(answers),
-        "questions": [
-            {
-                "question_id": i["question_id"],
-                "sort_order": i["sort_order"],
-                "type": i["type"],
-                "score": float(i["score"]),
-                "content": i["content"],
-                "options": i["options"],
-            }
-            for i in sorted(record.snapshot_json["items"], key=lambda x: x["sort_order"])
-        ],
-        "answers": answers,
-    }
+def settle_as_timeout(db: Session, record: ExamRecord) -> dict[str, Any] | None:
+    from app.services.exam_admin_svc import settle_as_timeout as _settle_timeout
+    return _settle_timeout(db, record)
 
 
-def score_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
-    paper = db.get(Paper, record.paper_id)
-    answers = {
-        a.question_id: a for a in db.scalars(select(Answer).where(Answer.record_id == record.id))
-    }
-    details = []
-    for i in sorted(record.snapshot_json["items"], key=lambda x: x["sort_order"]):
-        a = answers.get(i["question_id"])
-        details.append(
-            {
-                "question_id": i["question_id"],
-                "type": i["type"],
-                "sort_order": i["sort_order"],
-                "full_score": float(i["score"]),
-                "score": None if a is None or a.score is None else float(a.score),
-                "is_correct": a.is_correct if a else None,
-                "review_status": a.review_status if a else None,
-                "review_comment": a.review_comment if a else None,
-            }
-        )
-    return {
-        "record_id": record.id,
-        "paper_id": record.paper_id,
-        "paper_title": paper.title if paper else "",
-        "status": record.status,
-        "submit_kind": record.submit_kind,
-        "review_state": record.review_state,
-        "auto_score": float(record.auto_score) if record.auto_score is not None else None,
-        "manual_score": float(_manual_sum(db, record.id)),
-        "earned_score": float(record.earned_score) if record.earned_score is not None else None,
-        "full_score": float(record.snapshot_json["full_score"]),
-        "pending_review_count": _pending_count(db, record.id),
-        "submitted_at": record.submitted_at,
-        "deadline_at": record.deadline_at,
-        "is_finalized": record.review_state == ReviewState.FINAL,
-        "details": details,
-    }
-
-
-def answers_payload(db: Session, record: ExamRecord) -> dict[str, Any]:
-    student = db.get(User, record.student_id)
-    answers = {
-        a.question_id: a for a in db.scalars(select(Answer).where(Answer.record_id == record.id))
-    }
-    items = [
-        {
-            "question_id": i["question_id"],
-            "type": i["type"],
-            "sort_order": i["sort_order"],
-            "full_score": float(i["score"]),
-            "student_answer": getattr(answers.get(i["question_id"]), "student_answer", ""),
-            "review_status": getattr(answers.get(i["question_id"]), "review_status", None),
-            "score": _opt_float(getattr(answers.get(i["question_id"]), "score", None)),
-            "review_comment": getattr(answers.get(i["question_id"]), "review_comment", None),
-            "reference_answer": i["correct_answer"],
-        }
-        for i in sorted(record.snapshot_json["items"], key=lambda x: x["sort_order"])
-    ]
-    return {
-        "record_id": record.id,
-        "paper_id": record.paper_id,
-        "student": student,
-        "pending_review_count": _pending_count(db, record.id),
-        "items": items,
-    }
-
-
-def _opt_float(value: Any) -> float | None:
-    return None if value is None else float(value)
-
-
-def list_my_records(
-    db: Session, student: User, page: int, page_size: int
-) -> tuple[list[dict[str, Any]], int]:
-    page = max(1, page)
-    page_size = min(max(1, page_size), 100)
-    reap_expired(db, student_id=student.id)
-    total = int(
-        db.scalar(
-            select(func.count()).select_from(ExamRecord).where(ExamRecord.student_id == student.id)
-        )
-        or 0
-    )
-    records = list(
-        db.scalars(
-            select(ExamRecord)
-            .where(ExamRecord.student_id == student.id)
-            .order_by(ExamRecord.started_at.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-        )
-    )
-    titles = {
-        p.id: p.title
-        for p in db.scalars(
-            select(Paper).where(Paper.id.in_([r.paper_id for r in records] or [-1]))
-        )
-    }
-    now = time_utils.now()
-    out = [
-        {
-            "record_id": r.id,
-            "paper_id": r.paper_id,
-            "paper_title": titles.get(r.paper_id, ""),
-            "status": r.status,
-            "submit_kind": r.submit_kind,
-            "review_state": r.review_state,
-            "earned_score": float(r.earned_score) if r.earned_score is not None else None,
-            "full_score": float(r.snapshot_json["full_score"]),
-            "started_at": r.started_at,
-            "deadline_at": r.deadline_at,
-            "submitted_at": r.submitted_at,
-            "remaining_seconds": (
-                remaining_seconds(now, r.deadline_at)
-                if r.status == RecordStatus.IN_PROGRESS
-                else 0
-            ),
-            "cheat_count": r.cheat_count,
-        }
-        for r in records
-    ]
-    return out, total
-
-
-def record_or_404(db: Session, record_id: int) -> ExamRecord:
+# ------------------------------------------------------------------ 记录存取
+def _load_student_record(db: Session, record_id: int, student_id: int) -> ExamRecord:
     record = db.get(ExamRecord, record_id)
-    if record is None:
+    if record is None or record.student_id != student_id:
         raise AppError.make("RECORD_NOT_VISIBLE")
     return record
+
+
+def _load_creator_record(db: Session, record_id: int, teacher_id: int) -> ExamRecord:
+    record = db.get(ExamRecord, record_id)
+    paper = None if record is None else db.get(Paper, record.paper_id)
+    if record is None or paper is None or paper.creator_id != teacher_id:
+        raise AppError.make("RECORD_NOT_VISIBLE")
+    return record
+
+
+def load_record_for_reader(db: Session, record_id: int, user: User) -> ExamRecord:
+    """学生读自己的；老师读自己试卷的；其余一律同一形态 404（EC-19）。"""
+    if user.role == Role.STUDENT:
+        return _load_student_record(db, record_id, user.id)
+    return _load_creator_record(db, record_id, user.id)
+
+
+def _record_for_update(db: Session, record_id: int) -> ExamRecord:
+    """行锁加载：批改与作答的读-改-写必须在同一事务内原子（B11）。"""
+    record = db.get(ExamRecord, record_id, with_for_update=True)
+    if record is None:  # pragma: no cover - 调用方已判 404
+        raise AppError.make("RECORD_NOT_VISIBLE")
+    return record
+
+
+def _snapshot_item(record: ExamRecord, question_id: int) -> dict[str, Any]:
+    for item in record.snapshot_json["items"]:
+        if item["question_id"] == question_id:
+            return item
+    raise AppError.make("QUESTION_NOT_IN_PAPER", f"题目 {question_id} 不在本卷判分基线内")
+
+
+def _submitted_hint(record: ExamRecord) -> dict[str, Any]:
+    return {
+        "record_id": record.id,
+        "submitted_at": record.submitted_at.isoformat() if record.submitted_at else None,
+        "earned_score": float(record.earned_score) if record.earned_score is not None else None,
+    }

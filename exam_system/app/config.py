@@ -40,6 +40,7 @@ class Settings:
     test_redis_url: str = ""
     min_exam_window_seconds: int = 60
     min_window_ratio: float = 0.1
+    env: str = "prod"  # dev=开放 /docs 等交互文档；prod=关闭（V-07）
     base_dir: Path = field(default=_BASE, repr=False)
 
 
@@ -54,6 +55,7 @@ def get_settings() -> Settings:
         teacher_register_code=os.getenv("TEACHER_REGISTER_CODE", ""),
         test_database_url=os.getenv("TEST_DATABASE_URL", ""),
         test_redis_url=os.getenv("TEST_REDIS_URL", ""),
+        env=os.getenv("ENV", "prod").strip().lower(),
     )
 
 

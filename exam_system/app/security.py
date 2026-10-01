@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -20,6 +21,10 @@ from app.exceptions import AppError
 from app.models import Role, User
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# passlib 1.7.4 用 bcrypt.__about__.__version__ 探测版本，bcrypt 4.1+ 已移除该模块，
+# 首次哈希会打一行 "(trapped) error reading bcrypt version" 假警报（trapped=内部已捕获，功能不受影响）。
+# 压到 ERROR 级：正常路径不刷屏；passlib 真出事时 ERROR 日志仍会露出。
+logging.getLogger("passlib").setLevel(logging.ERROR)
 _bearer = HTTPBearer(auto_error=False)
 
 # bcrypt 只处理前 72 字节；schemas 已限长 8~64，这里再兜一层防越界
@@ -33,7 +38,9 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     try:
         return pwd_context.verify(_check_length(plain), hashed)
-    except (ValueError, TypeError):  # pragma: no cover - 非法哈希串
+    except (ValueError, TypeError, AppError):  # pragma: no cover - 非法哈希串/超长密码
+        # V-10 修复：>72 字节密码在 _check_length 抛 AppError，之前冒泡成 400（可区分错误路径）。
+        # 这里统一吞掉返回 False，使登录失败一律 401 INVALID_CREDENTIALS。
         return False
 
 

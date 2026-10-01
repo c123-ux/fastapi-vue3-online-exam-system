@@ -15,6 +15,7 @@ from sqlalchemy import text
 from app.config import settings
 from app.database import engine
 from app.exceptions import register_exception_handlers
+from app.middleware import RateLimitMiddleware, RequestLoggingMiddleware, setup_cors
 from app.routers import auth, exams, papers, questions, stats
 from app.schemas import HealthOut
 
@@ -57,13 +58,24 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 
 def create_app() -> FastAPI:
+    # V-07：非开发环境关闭 /docs /redoc /openapi.json，减少攻击面测绘。
+    #    开发（settings.env == "dev"）保留，便于教学与排查。
+    docs = settings.env == "dev"
     app = FastAPI(
         title="在线考试系统",
         version="1.0",
         description="RBAC + 判分引擎 + Redis 限时 + 幂等防重（教学练手项目三）",
         lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
     register_exception_handlers(app)
+    setup_cors(app)
+    # V-06：先 add RateLimit（内层），再 add RequestLogging（外层）。
+    #    这样被限流的 429 也先经过日志中间件，保证带 X-Request-ID 并写请求日志。
+    app.add_middleware(RateLimitMiddleware, prefixes=("/api/exams", "/api/papers"), max_requests=120, window_seconds=60)
+    app.add_middleware(RequestLoggingMiddleware)
     # 挂载顺序即路由匹配顺序（D2 §5.5）：auth → questions → papers → exams → stats
     app.include_router(auth.router)
     app.include_router(questions.router)

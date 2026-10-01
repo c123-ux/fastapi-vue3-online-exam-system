@@ -160,7 +160,9 @@ def list_questions(
     if difficulty:
         conds.append(Question.difficulty == difficulty)
     if keyword:
-        conds.append(Question.content.like(f"%{keyword}%"))
+        # V-08 修复：把用户输入里的 LIKE 通配符转义为字面量，避免 `%`/`_` 绕过过滤。
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append(Question.content.like(f"%{escaped}%", escape="\\"))
     total = db.scalar(select(func.count()).select_from(Question).where(*conds)) or 0
     rows = list(
         db.scalars(

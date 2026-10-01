@@ -175,6 +175,14 @@ def snapshot_specs(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def snapshot_item(snapshot: dict[str, Any], question_id: int) -> dict[str, Any]:
+    """从判分基线中取一题。"""
+    for item in snapshot["items"]:
+        if item["question_id"] == question_id:
+            return item
+    raise AppError.make("QUESTION_NOT_IN_PAPER", f"题目 {question_id} 不在本卷判分基线内")
+
+
 def list_papers_for_user(db: Session, user_id: int, role: str) -> list[Paper]:
     if role == "teacher":
         return list(db.scalars(select(Paper).where(Paper.creator_id == user_id).order_by(Paper.id.desc())))

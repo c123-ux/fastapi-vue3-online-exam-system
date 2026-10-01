@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from app import snapshot_guard
 from app.exceptions import AppError
 from app.models import (
     Answer,
@@ -52,6 +53,8 @@ def paper_results(db: Session, teacher_id: int, paper_id: int) -> dict[str, Any]
     _require_creator(db, paper_id, teacher_id)
     reaped = exam_svc.reap_expired(db, paper_id=paper_id)
     records = _finished_records(db, paper_id)
+    for r in records:
+        snapshot_guard.verified_snapshot(r)
     students = {
         u.id: u
         for u in db.scalars(

@@ -17,22 +17,22 @@ from app.services import question_svc
 router = APIRouter(prefix="/api", tags=["questions"])
 
 
-@router.post("/categories", response_model=CategoryOut)
+@router.post("/categories", response_model=CategoryOut, summary="创建分类", description="创建题目分类，名称全局唯一。")
 def create_category(payload: CategoryIn, db: DbSession, _: CurrentTeacher) -> CategoryOut:
     return question_svc.create_category(db, payload.name)
 
 
-@router.get("/categories", response_model=list[CategoryOut])
+@router.get("/categories", response_model=list[CategoryOut], summary="分类列表", description="列出所有题目分类。")
 def list_categories(db: DbSession, _: CurrentTeacher) -> list[CategoryOut]:
     return question_svc.list_categories(db)
 
 
-@router.post("/questions", response_model=QuestionOut)
+@router.post("/questions", response_model=QuestionOut, summary="创建题目", description="创建题库题目，支持单选/多选/判断/简答四种题型。")
 def create_question(payload: QuestionIn, db: DbSession, teacher: CurrentTeacher) -> QuestionOut:
     return question_svc.create_question(db, teacher.id, payload)
 
 
-@router.get("/questions", response_model=QuestionListOut)
+@router.get("/questions", response_model=QuestionListOut, summary="题目列表", description="分页筛选题目，支持按分类、题型、难度、关键词过滤。")
 def list_questions(
     db: DbSession,
     _: CurrentTeacher,
@@ -60,19 +60,19 @@ def list_questions(
     )
 
 
-@router.get("/questions/{question_id}", response_model=QuestionOut)
+@router.get("/questions/{question_id}", response_model=QuestionOut, summary="题目详情", description="获取单个题目详情，含正确答案。")
 def get_question(question_id: int, db: DbSession, _: CurrentTeacher) -> QuestionOut:
     return question_svc.get_question_or_404(db, question_id)
 
 
-@router.put("/questions/{question_id}", response_model=QuestionOut)
+@router.put("/questions/{question_id}", response_model=QuestionOut, summary="更新题目", description="更新题目内容；已被已发布试卷引用的题目内容锁定，不可修改。")
 def update_question(
     question_id: int, payload: QuestionIn, db: DbSession, _: CurrentTeacher
 ) -> QuestionOut:
     return question_svc.update_question(db, question_id, payload)
 
 
-@router.delete("/questions/{question_id}", response_model=OkOut)
+@router.delete("/questions/{question_id}", response_model=OkOut, summary="删除题目", description="删除未引用的题目；被试卷引用的题目不可删除。")
 def delete_question(question_id: int, db: DbSession, _: CurrentTeacher) -> OkOut:
     question_svc.get_question_or_404(db, question_id)
     question_svc.delete_question(db, question_id)

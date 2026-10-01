@@ -4,9 +4,9 @@
 > 从零实现的教育场景后端：RBAC 权限、四种题型的判分引擎、Redis 驱动的限时交卷、幂等防重复提交。
 > 定位是**真实可用的业务系统**（可给本校师生试用），不是只读 demo。
 
-- 技术栈：Python 3.12.13 + FastAPI + SQLAlchemy 2.0 + Alembic + MySQL 8.0.46 + 原生 Redis 5.0.14.1
-- 规模：`app/` 约 2200 行、`tests/` 约 2000 行；**118 个用例全绿**，`app.services` 覆盖率 **94.85%**
-- 文档：`docs/D1-需求文档.md`（v1.2）·`docs/D2-开发文档.md`（v1.2）·`docs/D3-测试文档.md`·`docs/D4-项目最终报告.md`
+- 技术栈：Python 3.12.13 + FastAPI + SQLAlchemy 2.0 + Alembic + MySQL 8.0.46 + 原生 Redis 5.0.14.1；前端 Vue 3.5 + TypeScript + Element Plus + Pinia（`frontend/`）
+- 规模：`app/` 约 2300 行、`tests/` 约 2200 行；**140 个用例全绿**，`app` 整体覆盖率 **96%**（services 95.4%，卡关门槛 80%）
+- 文档：`docs/D1-需求文档.md`（v1.2）·`docs/D2-开发文档.md`（v1.2）·`docs/D3-测试文档.md`
 
 ---
 
@@ -35,8 +35,9 @@
     │   ├── database.py        # engine / SessionLocal / get_db
     │   ├── models.py          # 7 张表
     │   ├── schemas.py         # Pydantic 入参校验 + 响应白名单
-    │   ├── security.py        # bcrypt、JWT、角色依赖
-    │   ├── redis_client.py    # 会话与提交标记（protocol=2 是硬要求）
+│   ├── security.py        # bcrypt、JWT、角色依赖（passlib/bcrypt 假警报已治理）
+│   ├── snapshot_guard.py  # 快照 HMAC-SHA256 指纹：判分基线完整性校验（防改库改分）
+│   ├── redis_client.py    # 会话与提交标记（protocol=2 是硬要求）
     │   ├── time_utils.py      # 单点时钟：全项目唯一 now()，测试在此注入假时间
     │   ├── exceptions.py      # AppError + 统一错误体（含 422 渲染）
     │   ├── services/          # question / paper / exam / grade / stats
@@ -245,7 +246,7 @@ curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/review -H "Authorization:
 | **超时** | 没有定时任务（需求文档禁调度组件）→ **惰性清算**：学生查成绩 / 老师查成绩统计 / 同卷开考时，把"进行中且已过宽限"的记录按已保存答案补判为 `submit_kind=timeout`，**照常进统计** |
 | **防重复提交** | 权威是 **DB 条件更新** `UPDATE ... WHERE id=? AND status='in_progress'`（`rowcount==1` 才有判分权）；Redis `EXISTS exam:submit:{rid}` 只是双击快速失败；`UNIQUE(paper_id,student_id)` 兜底防重复开考 |
 | **判分** | 单选/判断字符串严格相等；多选**集合全等**（少选/错选/多选一律 0 分）；简答不自动判——已答进 `needs_review`，未答直接 `skipped` 0 分定稿 |
-| **判分基准** | 开考瞬间把"题集+每题分值+正确答案"冻结进 `exam_records.snapshot_json`；题目被已发布试卷引用后内容锁定（409）→ 迟到的清算不会用"改后的答案"判分 |
+| **判分基准** | 开考瞬间把"题集+每题分值+正确答案"冻结进 `exam_records.snapshot_json` 并计算 **HMAC-SHA256 指纹**存 `snapshot_hash`；题目被已发布试卷引用后内容锁定（409）；全项目 13 处读快照路径（判分/作答/批改/续考/成绩/作答明细/我的记录/全班成绩）**先验签再使用**，篡改即 409 `SNAPSHOT_TAMPERED` 且记录状态零副作用（验签先于抢闸） |
 | **续考** | 每题 upsert 落库；`GET /api/exams` 找回记录；会话丢失时按 DB 剩余时间重建（TTL 只减不增） |
 
 ## 7. 测试
@@ -256,10 +257,10 @@ curl.exe -s -X POST http://127.0.0.1:8000/api/exams/36/review -H "Authorization:
 
 # 全量（集成用 exam_test 库 + Redis db1，跑之前必须先起 Redis）
 .venv\Scripts\python.exe -m pytest -q
-# 118 passed
+# 140 passed
 
 # 覆盖率：services 卡 80% 门槛，整体只报告
-.venv\Scripts\python.exe -m pytest --cov=app.services --cov-fail-under=80 -q   # 实得 94.85%
+.venv\Scripts\python.exe -m pytest --cov=app.services --cov-fail-under=80 -q   # 实得 95.4%
 .venv\Scripts\python.exe -m pytest --cov=app --cov-report=term-missing -q      # 实得 96%
 
 # 手工端到端（需要 uvicorn 在 8000 端口）
@@ -270,23 +271,35 @@ powershell -File scripts\verify_api.ps1     # 写入 docs/手工验证实录.txt
 因为 `utf8mb4_unicode_ci` 大小写不敏感、`ONLY_FULL_GROUP_BY`、Redis TTL 的 `-1/-2` 语义这些只在真组件上暴露。
 
 用例构成（明细见 `docs/D3-测试文档.md`）：单元 53（判分矩阵、时间纯函数、题型校验）+
-集成 65（RBAC、题库、组卷、考试流、提交批改、超时清算、统计、泄露与静态检查）。
+集成 87（RBAC、题库、组卷、考试流、提交批改、超时清算、统计、泄露与静态检查、**快照指纹红队 3 条**）。
 
 ## 8. 已知限制
 
-1. **无前端**（需求文档 P2 后置），全部能力走 HTTP API；切屏上报接口已实现但没有页面触发方。
+1. **前端为最小可用版**（`frontend/`，Vue 3.5 + Element Plus 2.9 + Pinia，开发服务器 5173，`/api` 代理 8000）：教学期以 Swagger 实验为主，倒计时/切屏上报等增强未接页面。
 2. **时间用服务端本地 naive datetime**，单机部署不做时区换算；`DATETIME(3)` 保毫秒。
 3. **JWT 无刷新、无登出黑名单**，有效期 240 分钟（必须 ≥ 最长考试时长 + 宽限，否则学生交不了卷）。
 4. **题库全局共享**：任何老师可增删未锁定的题；只有"被已发布试卷引用"才锁内容与分值。
 5. **教师注册码是单值环境变量**，不是邀请/审批体系；换码需改 `.env` 重启。
 6. **惰性清算意味着成绩不"准时"**：超时学生不再访问、老师也不看统计时，记录会停在 `in_progress`（数据仍完整，一旦被读到立刻补判）。
 7. **Redis 无 AOF（`appendonly no`）**，重启会丢会话与提交标记——已由 DB 事实源兜底，不丢正确性。
-8. 随机抽题组卷、提交限流、试卷缓存均为 P1 预留，**本期只有接口设计没有实现**。
-9. 密码只校验长度 8~64，无复杂度/历史校验；登录失败不区分"用户不存在/密码错"以防枚举，但注册接口仍会告知用户名占用（练手项目权衡）。
+8. 随机抽题组卷、试卷缓存为 P1 预留，本期只有接口设计没有实现；**登录/注册已加账号级限流、写路径已加 IP 级限流**（红队 V-03/V-04 修复）。
+9. 密码只校验长度 8~64（+拒绝纯空白），无复杂度/历史校验；登录失败不区分"用户不存在/密码错"以防枚举，但注册接口仍会告知用户名占用（练手项目权衡）。
 10. 单机单实例规模（≤ 百人考试）设计，未考虑分库分表、分布式锁与多实例并发清算的选型（DB 条件更新天然支持多实例，但没有压测数据支撑）。
+11. **记录 `review_state=final` 后，创建者老师仍可再次批改覆盖已定成绩**（红队 D-02）。该行为是业务取舍：允许老师订正；若需"定稿即不可变"，应在 `review_answer` 加"已 final 拒绝再批改"守卫。
+
+## 8.1 安全加固（红队复测后）
+
+
+- **信息泄露收敛**：注册/作答并发竞态不再返回 500 + MySQL 引擎错误原文（`IntegrityError`/`RedisError` 处理器不透出 `str(exc.orig)`）。
+- **限流**：登录/注册按账号限流（防单一攻击者锁死全网登录）；`/api/exams` `/api/papers` 写路径按 IP 限流；限流器带键数上限防内存耗尽。
+- **可观测**：被限流的 429 也带 `X-Request-ID`（V-06）。
+- **文档开关**：`ENV=dev` 开放 `/docs`，默认 `ENV=prod` 关闭（V-07）。
+- **输入净化**：题库 `keyword` 转义 LIKE 通配符（V-08）；拒绝纯空白密码（V-09）；>72 字节密码登录统一返回 401（V-10）。
+- **判分基线完整性**（2026-09-29）：快照 HMAC-SHA256 指纹 + 13 处读点验签，篡改返回 409 `SNAPSHOT_TAMPERED`（`app/snapshot_guard.py`，验签先于抢闸，红队用例 3 条）。
+- **依赖噪音**（2026-09-29）：passlib 1.7.4 对 bcrypt 4.1+ 的版本探测假警报（trapped，功能无损）已压到 ERROR 级，消音不消警。
 
 ## 9. 后续计划
 
-**本项目内可做**：随机抽题组卷（`SELECT id` + `random.sample`，避开 `ORDER BY RAND()`）、Excel 题库导入导出、简答题关键字预评分、成绩导出 CSV、Vue3 前端 + 真实倒计时、批量批改页。
+**本项目内可做**：随机抽题组卷（`SELECT id` + `random.sample`，避开 `ORDER BY RAND()`）、Excel 题库导入导出、简答题关键字预评分、成绩导出 CSV、前端增强（WebSocket 倒计时、切屏上报接入、批量批改页）、`cheat_count` 补 `server_default`。
 
 **架构演进**：Redis keyspace notification / 延迟队列做准实时自动交卷（替代惰性清算）、多实例部署下的会话共享与限流、审计日志与权限体系细化到班级、题目乱序与选项乱序防作弊。

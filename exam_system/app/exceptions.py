@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -12,6 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
+
+logger = logging.getLogger("exam.exceptions")
 
 # code -> (http_status, message)
 ERRORS: dict[str, tuple[int, str]] = {
@@ -47,6 +50,9 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ALREADY_SUBMITTED": (409, "exam record has already been submitted"),
     "NOT_IN_PROGRESS": (409, "exam record is not in progress"),
     "EXAM_TIME_UP": (409, "exam time is up, record has been settled as timeout"),
+    "SNAPSHOT_TAMPERED": (409, "grading baseline integrity check failed"),
+    # 429 限流
+    "RATE_LIMIT": (429, "too many requests"),
     # 500 依赖
     "REDIS_UNAVAILABLE": (500, "cache service is unavailable"),
     "DB_CONFLICT": (500, "database integrity conflict"),
@@ -111,14 +117,21 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RedisError)
     async def _redis_error(_: Request, exc: RedisError) -> JSONResponse:  # pragma: no cover
+        # 不透出 exc 原文（含连接地址/命令细节），仅给可复制的启动提示（EC-29 / NFR-08）
+        logger.error("RedisError: %s", exc)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content=error_body("REDIS_UNAVAILABLE", ERRORS["REDIS_UNAVAILABLE"][1], f"{exc}；{REDIS_HINT}"),
+            content=error_body("REDIS_UNAVAILABLE", ERRORS["REDIS_UNAVAILABLE"][1], REDIS_HINT),
         )
 
     @app.exception_handler(IntegrityError)
-    async def _integrity_error(_: Request, exc: IntegrityError) -> JSONResponse:  # pragma: no cover
+    async def _integrity_error(_: Request, exc: IntegrityError) -> JSONResponse:
+        # 不透出 str(exc.orig)（MySQL 1062/表名/约束名等引擎细节），统一给中文说明（V-01/V-02 信息泄露修复）
+        logger.error("IntegrityError: %s", exc)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content=error_body("DB_CONFLICT", ERRORS["DB_CONFLICT"][1], str(exc.orig)),
+            content=error_body(
+                "DB_CONFLICT", ERRORS["DB_CONFLICT"][1],
+                "数据约束冲突，请检查提交内容是否重复。",
+            ),
         )

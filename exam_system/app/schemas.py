@@ -22,6 +22,14 @@ class RegisterIn(BaseModel):
     full_name: str | None = Field(default=None, max_length=50)
     teacher_code: str | None = Field(default=None, max_length=64)
 
+    @field_validator("password")
+    @classmethod
+    def _password_not_blank(cls, v: str) -> str:
+        # V-09 修复：拒绝纯空白密码（8 个空格能通过 min_length，但等于没设密码）。
+        if not v.strip():
+            raise ValueError("密码不能为纯空白")
+        return v
+
 
 class TokenIn(BaseModel):
     username: str = Field(min_length=1, max_length=50)

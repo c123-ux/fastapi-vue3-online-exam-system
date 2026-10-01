@@ -36,32 +36,34 @@ router = APIRouter(prefix="/api/exams", tags=["exams"])
 
 
 # ---------------------------------------------------------------- 学生：开考与作答
-@router.post("/{paper_id}/start", response_model=StartOut)
+@router.post("/{paper_id}/start", response_model=StartOut, summary="开始考试", description="开考或续考；幂等返回原记录，deadline 永不延长。")
 def start(paper_id: int, db: DbSession, student: CurrentStudent) -> StartOut:
+    """创建考试记录并返回题面（不含正确答案）与剩余时间。"""
     record, resumed = exam_svc.start_exam(db, student, paper_id)
     payload = exam_svc.resume_payload(db, record)
     payload["resumed"] = resumed
     return StartOut.model_validate(payload)
 
 
-@router.get("", response_model=RecordListOut)
+@router.get("", response_model=RecordListOut, summary="我的考试记录", description="分页列出当前学生的所有考试记录。")
 def my_records(
     db: DbSession,
     student: CurrentStudent,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> RecordListOut:
+    """返回记录列表，已超时未清算的记录会在此处触发惰性清算。"""
     items, total = exam_svc.list_my_records(db, student, page, page_size)
     return RecordListOut(total=total, page=page, page_size=page_size, items=items)
 
 
-@router.get("/{record_id}", response_model=StartOut)
+@router.get("/{record_id}", response_model=StartOut, summary="续考快照", description="按 record_id 找回考试快照，用于换设备续考。")
 def resume(record_id: int, db: DbSession, student: CurrentStudent) -> StartOut:
     record = exam_svc.load_record_for_reader(db, record_id, student)
     return StartOut.model_validate(exam_svc.resume_payload(db, record))
 
 
-@router.post("/{record_id}/answer", response_model=SavedOut)
+@router.post("/{record_id}/answer", response_model=SavedOut, summary="保存作答", description="逐题保存/覆盖答案（upsert）；超宽限自动触发超时清算。")
 def answer(record_id: int, payload: AnswerIn, db: DbSession, student: CurrentStudent) -> SavedOut:
     count = exam_svc.save_answer(db, student, record_id, payload.question_id, payload.answer)
     record = exam_svc.record_or_404(db, record_id)
@@ -72,12 +74,12 @@ def answer(record_id: int, payload: AnswerIn, db: DbSession, student: CurrentStu
     )
 
 
-@router.post("/{record_id}/submit", response_model=SubmitOut)
+@router.post("/{record_id}/submit", response_model=SubmitOut, summary="交卷判分", description="主动交卷；幂等，重复提交返回首次成绩。")
 def submit(record_id: int, db: DbSession, student: CurrentStudent) -> SubmitOut:
     return SubmitOut.model_validate(exam_svc.submit_exam(db, student, record_id))
 
 
-@router.post("/{record_id}/cheat-report", response_model=CheatOut)
+@router.post("/{record_id}/cheat-report", response_model=CheatOut, summary="切屏上报", description="学生主动上报切屏；仅 DB 计数，不依赖 Redis。")
 def cheat_report(
     record_id: int, payload: CheatIn, db: DbSession, student: CurrentStudent
 ) -> CheatOut:
@@ -85,7 +87,7 @@ def cheat_report(
 
 
 # ---------------------------------------------------------------- 成绩与批改
-@router.get("/{record_id}/score", response_model=ScoreOut)
+@router.get("/{record_id}/score", response_model=ScoreOut, summary="考试成绩", description="学生查自己的成绩；老师查所创建试卷的成绩。")
 def score(record_id: int, db: DbSession, user: CurrentUser) -> ScoreOut:
     record = exam_svc.load_record_for_reader(db, record_id, user)
     exam_svc.settle_as_timeout(db, record)
@@ -93,13 +95,13 @@ def score(record_id: int, db: DbSession, user: CurrentUser) -> ScoreOut:
     return ScoreOut.model_validate(exam_svc.score_payload(db, record))
 
 
-@router.get("/{record_id}/answers", response_model=AnswersOut)
+@router.get("/{record_id}/answers", response_model=AnswersOut, summary="学生作答明细", description="仅该卷创建老师可见，包含 student_answer 与 reference_answer。")
 def answers(record_id: int, db: DbSession, teacher: CurrentTeacher) -> AnswersOut:
     record = exam_svc.load_record_for_reader(db, record_id, teacher)
     return AnswersOut.model_validate(exam_svc.answers_payload(db, record))
 
 
-@router.post("/{record_id}/review", response_model=ReviewOut)
+@router.post("/{record_id}/review", response_model=ReviewOut, summary="批改简答题", description="仅限简答题；已交卷状态才能批改，分值必须在 0~题面分之间。")
 def review(
     record_id: int, payload: ReviewIn, db: DbSession, teacher: CurrentTeacher
 ) -> ReviewOut:
